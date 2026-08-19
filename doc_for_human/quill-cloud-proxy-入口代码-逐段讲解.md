@@ -534,3 +534,146 @@ main() 建监听、accept循环
 
 1. `maybeServeResponsesWebSearch` 只挂在 `routeType == "responses"` 分支（3.5 节），而 `maybeServeFusion` 挂在通用分发链上、对 `/v1/chat/completions` 传入的 Prometheus 2.0 请求生效——这是"生产环境搜索工具与 fusion 面板阶段架构上互不相通"这一结论在入口代码层面的又一处直接证据（此前已从 `fusion.go` 内部的 `fusionConfigFromTools` 不注入新工具、以及两个文件间零功能耦合这两个角度证实过；这是第三个独立的代码位置）。
 2. `isFusionModel`/`fusionPresetPanelForModel` 这两个函数是**纯粹的字符串匹配/查表**，不含任何"评测模式"或"是否来自 DRACO 复现代码"的判断逻辑——换句话说，**生产网关代码本身完全无法区分一个 `model="trustedrouter/prometheus-2.0"` 的请求，究竟是真实付费用户发的，还是 DRACO 评测脚本（`draco_agentic_solo.py`/`draco_client_fusion.py`）在测试时发的**。这与此前结论一致：77.4 分对应的评测方法论（Path B）走的是完全独立的 Python 评测代码库（`TrustedRouter-Fusion-Draco`），并非直接调用这条生产 HTTP 入口；生产入口只是"被评测脚本当作面板成员的调用后端之一"（评测里单个模型的 solo 调用可能经过这个网关，但完整的 Prometheus 2.0 融合流程本身在评测里是评测脚本自己实现的编排，不是靠一次性调用 `trustedrouter/prometheus-2.0` 这个融合模型名跑出来的）。这一点此前文档已反复强调，这里从入口代码角度再次印证：**这条 `maybeServeFusion` 链路是"产品线上用户真实调用 Prometheus 2.0"的入口，不是 77.4 分评测跑分时代码实际执行的入口**——评测的入口是 `draco_agentic_solo.py`/`draco_client_fusion.py`（已在《DRACO评测代码-逐段讲解.md》中详述）。
+
+---
+
+## 8. 三阶段默认Prompt完整还原（假设调用方未传`tools`、未自定义`panel_prompt`/`synthesis_prompt`）
+
+本节把面板、判官、合成三个阶段实际发给上游模型的完整`messages`数组，按代码逻辑原样拼出来。前提假设：调用方只传了最基本的`model: "trustedrouter/prometheus-2.0"` + 自己的对话内容，**没有**传`tools`、`plugins`、`panel_prompt`、`synthesis_prompt`等任何自定义参数。
+
+**一个重要的前提说明**：`config.BuiltInPanelPrompt`/`config.BuiltInFinalPrompt`这两个内置prompt模板的真实内容，是运行时从TrustedRouter控制面的secret（`QUILL_SYNTH_PANEL_PROMPT_SECRET`等）里拉取的，**这份公开代码库里没有其明文内容**（详见本文档之前关于`config.PanelPrompt`/`config.BuiltInPanelPrompt`的讨论）。下面还原的是**这两个secret为空时代码里硬编码的兜底文案**——这是公开代码库里唯一能直接看到的字面文本，真实生产环境很可能用的是secret里的、我们看不到的内容，下面的还原在"结构"和"兜底文案"层面是准确的，但不能保证与生产环境实际使用的（保密的）文案完全一致。
+
+面板成员的模型名，取`fusionPrometheus20Panel`（`fusion.go`第130~136行）的真实值：
+
+```go
+var fusionPrometheus20Panel = []string{
+    "minimax/minimax-m3",
+    "moonshotai/kimi-k3",
+    "z-ai/glm-5.2",
+    "deepseek/deepseek-v4-pro-0423",
+    "xiaomi/mimo-v2.5-pro",
+}
+```
+
+### 8.1 面板阶段——5份独立请求，每份只有细微差别（成员编号不同）
+
+对应代码（`fusionPanelRequest`）：`out.Tools`因无caller工具而为空，因此不会追加"如果需要调用工具请直接输出"那句；`config.PanelPrompt`为空，因此不会追加"Additional caller panel instructions"。
+
+**面板成员1（`minimax/minimax-m3`）收到的完整messages：**
+```
+[system]
+You are TrustedRouter Synth panel member 1.
+
+Answer the request independently and return only the visible answer.
+
+[user]
+<调用方req.Messages里的原始用户消息，原样保留>
+```
+
+**面板成员2~5**结构完全一样，只有`panel member %d`里的数字（2/3/4/5）不同、实际调用的模型不同（分别是`moonshotai/kimi-k3`、`z-ai/glm-5.2`、`deepseek/deepseek-v4-pro-0423`、`xiaomi/mimo-v2.5-pro`），system prompt正文一字不差。
+
+### 8.2 判官阶段——1份请求，读5份面板答案
+
+对应代码（`fusionJudgeRequest`+`fusionJudgePrompt`）：
+
+```
+[system]
+You are the TrustedRouter Synth judge. Compare panel responses and return compact JSON with keys consensus, contradictions, partial_coverage, unique_insights, blind_spots, and final_guidance. Do not write the final answer. Return only JSON; do not include chain-of-thought, hidden reasoning, or <think> blocks.
+
+[user]
+Original request summary:
+USER: <调用方原始用户消息文本>
+
+Panel responses:
+
+[1] model=minimax/minimax-m3
+<面板成员1的回答文本（若为工具调用，则是"Proposed tool call(s): 工具名(参数JSON)"这样的转述文字）>
+
+[2] model=moonshotai/kimi-k3
+<面板成员2的回答文本>
+
+[3] model=z-ai/glm-5.2
+<面板成员3的回答文本>
+
+[4] model=deepseek/deepseek-v4-pro-0423
+<面板成员4的回答文本>
+
+[5] model=xiaomi/mimo-v2.5-pro
+<面板成员5的回答文本>
+```
+
+（`out.ResponseFormat = {"type":"json_object"}`额外在API层面强制这次调用必须输出合法JSON，不属于prompt文本本身，但是理解判官阶段的必要背景。）
+
+### 8.3 合成阶段——1份请求，读原始对话+5份面板答案+判官JSON
+
+对应代码（`fusionFinalRequest`）：`instruction`因`BuiltInFinalPrompt`为空（假设secret未生效）而使用兜底文案；因无caller工具，不追加"emit the tool call directly"那句；`config.SynthesisPrompt`为空，不追加"Additional caller synthesis instructions"。
+
+```
+[... 原样保留调用方的 req.Messages，即用户原始对话历史 ...]
+
+[user]（新追加的一条消息）
+Use the panel answers as evidence and the judge analysis as guidance to answer the original request. Return only the final visible answer.
+
+Panel answers:
+
+[1] model=minimax/minimax-m3
+<面板成员1的回答文本>
+
+[2] model=moonshotai/kimi-k3
+<面板成员2的回答文本>
+
+[3] model=z-ai/glm-5.2
+<面板成员3的回答文本>
+
+[4] model=deepseek/deepseek-v4-pro-0423
+<面板成员4的回答文本>
+
+[5] model=xiaomi/mimo-v2.5-pro
+<面板成员5的回答文本>
+
+Judge analysis JSON:
+<判官阶段输出的原始JSON文本，例如 {"consensus":"...","contradictions":"...",...}>
+```
+
+**与判官阶段的一个细微差异**：合成阶段用的`fusionPanelEvidence(panel)`是**完整原样**使用（保留"Panel answers:\n"这行标题）；判官阶段用的是`strings.TrimPrefix(fusionPanelEvidence(panel), "Panel answers:\n")`，即**去掉了这行标题**（因为判官自己已经写了"Panel responses:\n"作为标题，避免重复）——这是本文档前面已经讲过的`TrimPrefix`用法，这里作为两处证据格式的唯一文字差异标注出来。
+
+### 8.4 三阶段一览对比表
+
+| | 面板（×5） | 判官（×1） | 合成（×1） |
+|---|---|---|---|
+| system prompt | "You are TrustedRouter Synth panel member N.\n\n" + 兜底/内置文案 | 固定英文system prompt（完全公开，无secret依赖） | 无独立system message，指令拼进新追加的user消息里 |
+| 能看到原始用户消息吗 | 是（system prompt之后紧跟用户原始对话） | 否（只看到`chatMessagesText`转述的摘要文本，不是原始messages结构） | 是（原始`req.Messages`被完整复制保留，指令追加在其后） |
+| 能看到面板证据吗 | 不适用 | 是（`fusionJudgePrompt`拼入） | 是（`fusionPanelEvidence`拼入） |
+| 能看到判官JSON吗 | 不适用 | 不适用（判官自己就是产出方） | 是（拼在user消息末尾） |
+| 工具（默认无caller tools时） | 无 | 强制`nil`，与是否有caller tools无关 | 无 |
+| 是否强制JSON输出 | 否 | 是（`response_format: json_object`） | 否 |
+
+### 8.5 对比版本：调用方这次请求确实传了`tools`时，面板与合成阶段多出的那一句
+
+8.1、8.3节的还原，都是在"调用方未传`tools`"这个前提下得到的——两处对应代码里都有一句`if len(out.Tools) > 0 { ... }`，因为前提不满足所以被略去了。判官阶段不受此影响（`out.Tools`被硬编码为`nil`，不管调用方传不传tools都没有这句）。如果调用方这次请求带了`tools`，两处还原分别变成：
+
+**面板阶段（`fusionPanelRequest`），system prompt多一段：**
+```
+[system]
+You are TrustedRouter Synth panel member 1.
+
+Answer the request independently and return only the visible answer.
+
+If the next correct step is a provided function call, emit the tool call directly instead of describing it.
+
+[user]
+<调用方req.Messages里的原始用户消息，原样保留>
+```
+
+**合成阶段（`fusionFinalRequest`），instruction多一段：**
+```
+[user]（新追加的一条消息）
+Use the panel answers as evidence and the judge analysis as guidance to answer the original request. Return only the final visible answer.
+
+If the next correct action is a provided function call, emit the tool call directly instead of describing it in text. Return visible text only when no tool call is needed.
+
+Panel answers:
+...（其余不变）
+```
+
+两句话文字上略有差异（面板是"next correct **step**"，合成是"next correct **action**"，合成还多了一句"Return visible text only when no tool call is needed"），但触发条件和作用是对称的：**只有调用方这次请求确实携带了`tools`，这两句提示才会分别出现在面板成员和合成模型的prompt里**；判官阶段则完全不受影响，因为它的`out.Tools`是无条件清空的。
